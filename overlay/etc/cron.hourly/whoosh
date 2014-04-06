@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# cron script to run incremental build of whoosh index
+BIN_DIR=/var/www/rhodecode/venv/bin
+CONF=/var/www/rhodecode/production.ini
+
+$BIN_DIR/paster make-index $CONF

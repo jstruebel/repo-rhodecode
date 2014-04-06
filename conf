@@ -1,0 +1,107 @@
+#!/bin/bash -ex
+install()
+{
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get -y \
+        -o DPkg::Options::=--force-confdef \
+        -o DPkg::Options::=--force-confold \
+        install $@
+}
+
+DB_PASS=turnkey
+DB_USER=rhodecode
+DB_NAME=rhodecode
+
+# temporarily add current host to chroot hosts file for rabbitmq setup
+LOCAL_HOSTNAME=`hostname`
+CONF=/etc/hosts
+echo 127.0.0.1 $LOCAL_HOSTNAME temphost >> $CONF
+
+# install required packages
+install python-virtualenv python-pkg-resources python-setuptools python-dev libpython2.6 python2.6 python2.6-minimal libapache2-mod-wsgi libpython2.7 python2.7-dev libldap2-dev libssl-dev libsasl2-dev libsasl2-modules erlang-asn1 erlang-base erlang-corba erlang-crypto erlang-diameter erlang-edoc erlang-eldap erlang-erl-docgen erlang-eunit erlang-ic erlang-inets erlang-inviso erlang-mnesia erlang-nox erlang-odbc erlang-os-mon erlang-parsetools erlang-percept erlang-public-key erlang-runtime-tools erlang-snmp erlang-ssh erlang-ssl erlang-syntax-tools erlang-tools erlang-webtool erlang-xmerl libltdl7 libodbc1 rabbitmq-server 
+
+# install rhodecode
+INSTALL_DIR=/var/www/rhodecode/venv
+INSTALL_BIN=$INSTALL_DIR/bin
+INSTALLER=$INSTALL_BIN/easy_install
+mkdir -p $INSTALL_DIR
+wget -O /usr/local/src/rhodecode_v2.2.5.zip https://rhodecode.com/dl/2.2.5
+wget -O /usr/local/src/rhodecode-tools_v0.1.2.zip https://code.rhodecode.com/rhodecode-tools/archive/v0.1.2.zip
+
+virtualenv --no-site-packages $INSTALL_DIR
+$INSTALLER --prefix=$INSTALL_DIR /usr/local/src/rhodecode_v2.2.5.zip
+$INSTALLER --prefix=$INSTALL_DIR python-ldap
+$INSTALLER --prefix=$INSTALL_DIR /usr/local/src/rhodecode-tools_v0.1.2.zip
+$INSTALLER --prefix=$INSTALL_DIR mysql-python
+
+# configure rabbitmq
+rabbitmqctl add_user celeryuser $DB_PASS
+rabbitmqctl add_vhost celeryvhost
+rabbitmqctl set_permissions -p celeryvhost celeryuser ".*" ".*" ".*"
+
+# insert password in production.ini
+CONF=/var/www/rhodecode/production.ini
+sed -i "s|broker\.password.*|broker.password = $DB_PASS|" $CONF
+
+# start mysql server
+/etc/init.d/mysql start
+
+# create mysql database and user
+mysqladmin --defaults-extra-file=/etc/mysql/debian.cnf create $DB_NAME --default-character-set=utf8;
+mysql --defaults-extra-file=/etc/mysql/debian.cnf --batch --execute "grant all privileges on $DB_NAME.* to $DB_USER@localhost identified by '$DB_PASS'; flush privileges;"
+
+# insert password in production.ini
+CONF=/var/www/rhodecode/production.ini
+sed -i "s|beaker\.session\.sa\.url.*|beaker.session.sa.url = mysql://${DB_USER}:${DB_PASS}@localhost/$DB_NAME|" $CONF
+sed -i "s|sqlalchemy\.db1\.url.*|sqlalchemy.db1.url = mysql://${DB_USER}:${DB_PASS}@localhost/$DB_NAME|" $CONF
+
+# setup rhodecode
+RC_CONF=/var/www/rhodecode/production.ini
+$INSTALL_BIN/paster setup-rhodecode $RC_CONF --user=admin --password=$DB_PASS --email=admin@example.com --repos=/srv/repos --force-yes
+
+# setup directories for celeryd
+#mkdir -p /run/celeryd
+#chown www-data:www-data /run/celeryd
+mkdir -p /var/log/celeryd
+chown www-data:www-data /var/log/celeryd
+update-rc.d celeryd defaults
+
+# setup rcextensions
+#$INSTALL_BIN/rhodecode-extensions --plugins --config=$RC_CONF
+
+# remove link to public repos in git subdir
+rm /srv/repos/git/public
+
+# create data directory
+mkdir -p /var/www/rhodecode/data
+chown -R www-data:www-data /var/www/rhodecode/data
+
+# create archive cache directory
+mkdir -p /var/www/rhodecode/tarballcache
+chown -R www-data:www-data /var/www/rhodecode/tarballcache
+
+# ensure git and hg directories are writeable by www-data
+chown -R www-data:www-data /srv/repos/git
+chown -R www-data:www-data /srv/repos/hg
+
+# add link to static files so that apache can serve them directly
+ln -s /var/www/rhodecode/venv/lib/python2.7/site-packages/RhodeCode-2.2.5-py2.7.egg/rhodecode/public /var/www/rhodecode/public
+
+# install bcrypt in site wide python (required for rhodecode regen secrets)
+easy_install py-bcrypt==0.3.0
+
+# install mercurial 2.8.2 in site wide python (required with rhodecode & mod_wsgi)
+easy_install mercurial==2.8.2
+
+# enable rhodecode apache config
+a2ensite rhodecode
+
+# stop services started during install
+/etc/init.d/rabbitmq-server stop
+/etc/init.d/mysql stop
+/etc/init.d/apache2 stop
+epmd -kill
+
+# remove current hostname from hosts file added above
+CONF=/etc/hosts
+sed -i "/127\.0\.0\.1 $LOCAL_HOSTNAME temphost/ d" $CONF
